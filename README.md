@@ -4,7 +4,7 @@ A GitHub Actions template for building, scanning, and hardening OSS container im
 
 Designed for teams that need to defensibly self-host third-party OSS containers but don't want to pay Chainguard or Docker Hardened Images pricing. Rebases onto [Google's distroless](https://github.com/GoogleContainerTools/distroless) by default; any minimal base works.
 
-For the "why and when" argument behind this pipeline, see the companion post: *[Stop Pulling Random Docker Images](https://medium.com/@sventhekroll/stop-pulling-random-docker-images-c19e94559cc6)*.
+For the "why and when" argument behind this pipeline, see the companion post: *[Stop Pulling Random Docker Images](https://medium.thekroll.ltd/stop-pulling-random-docker-images-c19e94559cc6)*.
 
 ## What it does
 
@@ -211,7 +211,7 @@ Apache-2.0. Fork it, adapt it, ship it.
 
 ## Related
 
-- **Blog post:** *[Stop Pulling Random Docker Images](https://medium.com/@sventhekroll/stop-pulling-random-docker-images-c19e94559cc6)* — the argument and context this template implements
+- **Blog post:** *[Stop Pulling Random Docker Images](https://medium.thekroll.ltd/stop-pulling-random-docker-images-c19e94559cc6)* — the argument and context this template implements
 - **Live example:** [`THEKROLL-LTD/mirror-gokapi`](https://github.com/THEKROLL-LTD/mirror-gokapi) — a working fork that builds and scans `Forceu/Gokapi` nightly. Pipeline runs, PRs get merged, images land in `ghcr.io/thekroll-ltd/gokapi`. No SLA; use for reference or pull at your own risk
 
 ## Maintained by
