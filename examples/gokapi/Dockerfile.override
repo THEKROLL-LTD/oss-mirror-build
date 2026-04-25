@@ -1,0 +1,94 @@
+# Dockerfile.override for Forceu/Gokapi
+# -----------------------------------------------------------------------------
+# Replaces the upstream Dockerfile during the CI build.
+# Copy into your fork at: dockerfiles/Dockerfile.override
+#
+# Runtime base: gcr.io/distroless/static:nonroot
+#   - Apache-2.0, maintained by Google since 2017.
+#   - Contains: CA certs, /etc/passwd, tzdata. Nothing else.
+#   - No shell, no package manager. Runs as UID 65532 (nonroot).
+#
+# Differences from upstream Dockerfile:
+#   - No alpine runtime layer → no musl, no apk-tools, no su-exec, no tini.
+#     Container orchestrators (Kubernetes, Nomad) provide signal handling
+#     and privilege-dropping today; tini and su-exec were workarounds for
+#     raw `docker run`. Go's stdlib handles SIGTERM cleanly on its own.
+#   - No dockerentry.sh. The upstream script mainly adjusts UIDs when
+#     DOCKER_NONROOT=true is set; distroless:nonroot already runs as
+#     UID 65532 by default, so the script's purpose is met by the base.
+#     All Gokapi configuration is done via env vars and volume mounts.
+#   - No curl. If you use Kubernetes, health checks are HTTP-native.
+#     For raw Docker, use a wget-less check or add --health-cmd externally.
+#
+# Volumes expected at runtime:
+#   /app/data    — uploaded files, SQLite database
+#   /app/config  — configuration file(s)
+# Make sure your volume mounts are writable by UID 65532.
+#
+# First-time setup: verify Gokapi's main package path in case upstream
+# restructures. Current: github.com/forceu/gokapi/cmd/gokapi.
+
+# --- Build stage -------------------------------------------------------------
+FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS build
+
+WORKDIR /src
+RUN apk add --no-cache git
+
+COPY . .
+
+# Gokapi violates the Go-module convention for v2+: go.mod declares
+# `module github.com/forceu/gokapi` but tags are v2.x.x. Go rejects this
+# and stamps Main.Version with a meaningless pseudo-version, causing
+# scanners (Trivy, Grype) to false-positive against old-version CVEs.
+# We patch the module path to /v2 locally so the tag becomes a valid
+# Main.Version. See the project README ("Module-path patching") for
+# the pattern and when to apply it.
+RUN set -eux; \
+    sed -i 's|^module github.com/forceu/gokapi$|module github.com/forceu/gokapi/v2|' go.mod; \
+    find . -type f -name '*.go' -print0 \
+      | xargs -0 sed -i 's|github.com/forceu/gokapi/|github.com/forceu/gokapi/v2/|g'
+
+# Upstream runs `go generate ./...` to embed static assets before the build.
+# Keep that step identical; the Go generate pipeline compiles JS/CSS into
+# the binary via embed.FS.
+RUN go generate ./...
+
+# Commit the patched source and re-anchor the upstream tag on it.
+# Without a clean vcs tree the Go linker stamps Main.Version=(devel).
+# Without the retag on HEAD it emits a pseudo-version instead of the tag.
+# VERSION is injected by the CI workflow via --build-arg.
+ARG VERSION
+RUN set -eux; \
+    : "${VERSION:?set via docker build --build-arg VERSION=<upstream-tag>}"; \
+    git config user.email "mirror@build.local"; \
+    git config user.name  "mirror-build"; \
+    git add -A; \
+    git commit -m "mirror-build: patch module path to /v2"; \
+    git tag -f "${VERSION}"
+
+# CGO disabled → fully static binary. Matches upstream build flags.
+# Builder string identifies this image as our mirror build; handy for
+# the /api/info endpoint when diagnosing a running container.
+# Note: ldflag paths and build target use the patched /v2 module path.
+RUN CGO_ENABLED=0 \
+    GOOS=linux \
+    go build \
+      -trimpath \
+      -ldflags="-s -w \
+        -X 'github.com/forceu/gokapi/v2/internal/environment.IsDocker=true' \
+        -X 'github.com/forceu/gokapi/v2/internal/environment.Builder=oss-mirror-build'" \
+      -o /out/gokapi \
+      github.com/forceu/gokapi/v2/cmd/gokapi
+
+# --- Runtime stage -----------------------------------------------------------
+FROM gcr.io/distroless/static:nonroot@sha256:e3f945647ffb95b5839c07038d64f9811adf17308b9121d8a2b87b6a22a80a39
+
+COPY --from=build /out/gokapi /gokapi
+
+USER nonroot:nonroot
+EXPOSE 53842
+
+# Gokapi's default data and config paths. Mount volumes here at runtime.
+VOLUME ["/app/data", "/app/config"]
+
+ENTRYPOINT ["/gokapi"]

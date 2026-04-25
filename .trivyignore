@@ -1,0 +1,14 @@
+# .trivyignore — waivers for Trivy findings you have reviewed and accepted.
+#
+# Add one CVE ID per line. Comments above the ID are part of the file's git
+# history and become your audit trail for why a finding is not being fixed.
+#
+# Example:
+#
+#   # CVE-2025-12345 — libcurl in upstream base. Not reachable from our
+#   # deployment (container runs behind mTLS ingress, no outbound HTTP).
+#   # Revisit 2026-08 when upstream bumps the base image.
+#   CVE-2025-12345
+#
+# Leave this file empty (except for comments) until you actually need a waiver.
+# A waiver without a reason is just a mute button, not evidence.
