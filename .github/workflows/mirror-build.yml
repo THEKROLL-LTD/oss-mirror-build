@@ -222,6 +222,12 @@ jobs:
           severity: ${{ env.TRIVY_SEVERITY }}
           exit-code: '1'
           ignore-unfixed: true
+          # Without this, the action force-includes ALL severities in SARIF
+          # (UNKNOWN/LOW/MEDIUM/HIGH/CRITICAL) so the Security tab is
+          # "complete" — but exit-code is then evaluated against that full
+          # set, gating the build on findings below TRIVY_SEVERITY. We want
+          # the gate and the SARIF view to match what we declared as policy.
+          limit-severities-for-sarif: true
         continue-on-error: true
 
       - name: Upload Trivy SARIF to Security tab
@@ -474,6 +480,10 @@ jobs:
           severity: ${{ env.TRIVY_SEVERITY }}
           exit-code: '1'
           ignore-unfixed: true
+          # See note in build-scan-push job: keep SARIF and gate aligned
+          # with TRIVY_SEVERITY policy so the rescan only flags what would
+          # block a build.
+          limit-severities-for-sarif: true
         continue-on-error: true
 
       # Separate SARIF category from build-time `trivy-image` so the Security
