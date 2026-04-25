@@ -367,7 +367,12 @@ jobs:
           fi
 
           git commit -m "chore: mirror build ${NEW_TAG}"
-          git push --force-with-lease origin "$BRANCH"
+          # Bot owns the mirror-build/* branch namespace by convention; no
+          # human ever pushes here. --force-with-lease provides no real
+          # safety in that context and breaks on re-runs where the workflow's
+          # shallow checkout never fetched the branch's remote ref ("stale
+          # info" rejection). Plain --force is the correct primitive here.
+          git push --force origin "$BRANCH"
 
           PR_BODY=$(cat <<EOF
           ## Mirror build: ${LAST_TAG} → ${NEW_TAG}
