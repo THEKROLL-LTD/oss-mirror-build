@@ -8,10 +8,14 @@
 #   3. If dockerfiles/Dockerfile.override exists: replace upstream Dockerfile.
 #      (This is how you rebase onto distroless or DHI.)
 #   4. Generate a diff-review artifact vs. last built tag.
-#   5. Build the image once, load locally.
-#   6. Trivy scan → SARIF + CycloneDX SBOM. Block push on CRITICAL/HIGH.
-#   7. On block: file an issue. On pass: push to GHCR, open a PR with the
-#      digest pin on branch mirror-build/<tag>.
+#   5. Trivy fs scan of the cloned source (Hex/Mix, npm, pip, gem, …
+#      lockfiles that disappear from the runtime image during a release
+#      build). Catches language-layer CVEs that an image scan can't see.
+#   6. Build the image once, load locally.
+#   7. Trivy image scan → SARIF + CycloneDX SBOMs (image + fs). Block push
+#      if either scan finds CRITICAL/HIGH with available fix.
+#   8. On block: file a single issue covering both scans. On pass: push to
+#      GHCR, open a PR with the digest pin on branch mirror-build/<tag>.
 #
 # All audit artifacts retained 90 days.
 #
@@ -190,6 +194,65 @@ jobs:
             git diff "$LAST".."$NEW" > ../audit/diff-full.patch 2>/dev/null || true
           fi
 
+      # --- AUDIT 2a: Trivy fs scan of the cloned source ----------------------
+      # An image scan only sees what survives the build. For Go/Rust binaries
+      # that's enough — every dep is in the binary's BuildInfo. For Elixir,
+      # Python, Ruby, Node, etc. the lockfiles are build-stage-only and the
+      # runtime image is just compiled bytecode. Trivy fs reads mix.lock,
+      # package-lock.json, requirements.txt, Gemfile.lock, Cargo.lock, etc.,
+      # so we get language-layer CVEs no matter what runtime stack the
+      # upstream uses. For Go projects it's redundant with the image scan
+      # in the best case and slightly more complete in the worst — net win.
+      - name: Trivy fs scan
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: upstream-src
+          format: sarif
+          output: audit/trivy-fs.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+          ignore-unfixed: true
+          # See note on the image scan below: limit SARIF to TRIVY_SEVERITY
+          # so the gate and the Security tab agree on what counts.
+          limit-severities-for-sarif: true
+        continue-on-error: true
+
+      - name: Upload Trivy fs SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: audit/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Trivy fs scan (JSON for issue body)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: upstream-src
+          format: json
+          output: audit/trivy-fs.json
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '0'
+          ignore-unfixed: true
+
+      # Source-deps SBOM. Complementary to the image-deps SBOM produced
+      # below: this one captures Hex/npm/pip/gem/etc. exhaustively, the
+      # image SBOM captures OS packages and Go BuildInfo. Together they're
+      # a complete bill of materials.
+      - name: Generate fs SBOM
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: upstream-src
+          format: cyclonedx
+          output: audit/sbom-fs.cdx.json
+          exit-code: '0'
+
       # --- BUILD (single build, loaded locally) ------------------------------
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -252,21 +315,24 @@ jobs:
           exit-code: '0'
           ignore-unfixed: true
 
-      # --- AUDIT 3: CycloneDX SBOM -------------------------------------------
-      - name: Generate SBOM
+      # --- AUDIT 3: CycloneDX SBOM (image-side) ------------------------------
+      # OS-package layer + Go-binary BuildInfo. The fs SBOM above covers the
+      # language-layer manifests that don't survive into the runtime image.
+      - name: Generate image SBOM
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_tag }}
           format: cyclonedx
-          output: audit/sbom.cdx.json
+          output: audit/sbom-image.cdx.json
           exit-code: '0'
 
       # --- GATE --------------------------------------------------------------
+      # Either scan failing is enough to block the push. One issue per tag
+      # collects findings from both — see file-cve-issue.js (jsonPaths array).
       # Idempotent: re-runs against the same tag won't spam duplicate issues.
-      # See .github/scripts/file-cve-issue.js for create/update/no-op rules.
       - name: File or update CVE issue
-        if: always() && steps.trivy-scan.outcome == 'failure'
+        if: always() && (steps.trivy-scan.outcome == 'failure' || steps.trivy-fs.outcome == 'failure')
         uses: actions/github-script@v7
         env:
           NEW_TAG:  ${{ needs.check-upstream.outputs.new_tag }}
@@ -286,7 +352,7 @@ jobs:
                 image: process.env.IMG,
                 severity: process.env.SEV,
                 dockerfileSource: process.env.DFSRC,
-                jsonPath: 'audit/trivy-image.json',
+                jsonPaths: ['audit/trivy-image.json', 'audit/trivy-fs.json'],
               },
             });
 
@@ -299,9 +365,9 @@ jobs:
           retention-days: 90
 
       - name: Fail build if CVEs found
-        if: always() && steps.trivy-scan.outcome == 'failure'
+        if: always() && (steps.trivy-scan.outcome == 'failure' || steps.trivy-fs.outcome == 'failure')
         run: |
-          echo "::error::Trivy found vulnerabilities. Audit bundle + issue filed. Not pushing."
+          echo "::error::Trivy found vulnerabilities (image=${{ steps.trivy-scan.outcome }}, fs=${{ steps.trivy-fs.outcome }}). Audit bundle + issue filed. Not pushing."
           exit 1
 
       # --- PUSH (only reached if scan passed) --------------------------------
@@ -383,7 +449,8 @@ jobs:
 
           ### Scan results
           - Trivy image scan: clean (no CRITICAL/HIGH with available fix) — see [Security tab](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/security)
-          - CycloneDX SBOM: workflow-run artifact
+          - Trivy fs scan (Hex/npm/pip/gem/etc. lockfiles): clean
+          - CycloneDX SBOMs (image + fs): workflow-run artifact
           - Diff-review (${LAST_TAG} → ${NEW_TAG}): workflow-run artifact
 
           ### Before merging

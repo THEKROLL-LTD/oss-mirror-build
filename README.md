@@ -14,10 +14,13 @@ Each night (03:00 UTC by default), the pipeline in your fork:
 2. Clones the upstream source at that tag
 3. Applies your Dockerfile override if present — this is how you rebase onto distroless or any hardened base
 4. Generates a diff-review artifact: commit log and full patch between the last built tag and the new one
-5. Builds the container image once, loaded locally
-6. Scans the built image with [Trivy](https://github.com/aquasecurity/trivy), producing a SARIF report for the Security tab and a CycloneDX SBOM as a build artifact
-7. If any `CRITICAL` or `HIGH` vulnerability with an available fix is found: blocks the push, opens an issue, retains all artifacts
-8. If clean: pushes to your GHCR namespace and opens a pull request with the new digest pinned in `image-pin.yml`
+5. Runs a [Trivy](https://github.com/aquasecurity/trivy) **filesystem scan** of the cloned source, reading every language-layer lockfile (`mix.lock`, `package-lock.json`, `requirements.txt`, `Gemfile.lock`, `Cargo.lock`, `go.sum`, …)
+6. Builds the container image once, loaded locally
+7. Runs a Trivy **image scan**, producing a SARIF report for the Security tab and a CycloneDX SBOM as a build artifact
+8. If either scan finds a `CRITICAL` or `HIGH` vulnerability with an available fix: blocks the push, opens a single issue covering both scans, retains all artifacts
+9. If clean: pushes to your GHCR namespace and opens a pull request with the new digest pinned in `image-pin.yml`
+
+Why two scans: an image scan only sees what survives the build. For Go and Rust binaries that's enough — every dep is in the binary's BuildInfo. For Elixir, Python, Ruby, Node and similar runtimes the lockfiles are build-stage-only and the runtime image is just compiled bytecode, so the language-layer CVE landscape is invisible to an image-only scan. The fs scan closes that gap.
 
 On merge of the PR, your GitOps system (Flux, ArgoCD, or anything that pins `image-pin.yml`) rolls out the new digest.
 
@@ -109,8 +112,8 @@ ships v2.x.x+ tags, you need this patch. If `go.mod` already ends in
 - Image pushed to `ghcr.io/<your-org>/<image>:<tag>` and `ghcr.io/<your-org>/<image>@sha256:<digest>`
 - Pull request opened on branch `mirror-build/<tag>` against `main`
 - PR body contains: digest, Dockerfile source (`override` or `upstream`), scan summary, links to artifacts
-- CycloneDX SBOM, Trivy SARIF, diff-review markdown, full diff patch — all retained 90 days as workflow artifacts
-- Trivy findings uploaded to the repository's Security tab
+- CycloneDX SBOMs (image + fs), Trivy SARIFs (image + fs), diff-review markdown, full diff patch — all retained 90 days as workflow artifacts
+- Trivy findings uploaded to the repository's Security tab under categories `trivy-image`, `trivy-fs`, and `trivy-rescan`
 
 **Blocked path (CVE found):**
 
