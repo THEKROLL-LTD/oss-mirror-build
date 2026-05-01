@@ -14,6 +14,7 @@ Each night (03:00 UTC by default), the pipeline in your fork:
 2. Clones the upstream source at that tag
 3. Applies your Dockerfile override if present — this is how you rebase onto distroless or any hardened base
 4. Generates a diff-review artifact: commit log and full patch between the last built tag and the new one
+4a. **(override only)** Diffs the upstream Dockerfile path(s) — configurable via `UPSTREAM_DOCKERFILE_PATHS` — between the last reviewed tag and the new one. If anything changed, files an `override-review` issue and blocks the build until a human closes it. Catches silent drift between your `Dockerfile.override` and a restructured upstream Dockerfile that Trivy can't detect (new apt packages, renamed COPY paths, restructured build stages).
 5. Runs a [Trivy](https://github.com/aquasecurity/trivy) **filesystem scan** of the cloned source, reading every language-layer lockfile (`mix.lock`, `package-lock.json`, `requirements.txt`, `Gemfile.lock`, `Cargo.lock`, `go.sum`, …)
 6. Builds the container image once, loaded locally
 7. Runs a Trivy **image scan**, producing a SARIF report for the Security tab and a CycloneDX SBOM as a build artifact

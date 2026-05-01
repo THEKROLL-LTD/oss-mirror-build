@@ -8,6 +8,10 @@
 #   3. If dockerfiles/Dockerfile.override exists: replace upstream Dockerfile.
 #      (This is how you rebase onto distroless or DHI.)
 #   4. Generate a diff-review artifact vs. last built tag.
+#   4a. (override only) If upstream changed the Dockerfile path(s) listed in
+#       UPSTREAM_DOCKERFILE_PATHS, file/update an override-review issue and
+#       block until a human closes it. Catches silent drift between our
+#       override and a restructured upstream Dockerfile.
 #   5. Trivy fs scan of the cloned source (Hex/Mix, npm, pip, gem, …
 #      lockfiles that disappear from the runtime image during a release
 #      build). Catches language-layer CVEs that an image scan can't see.
@@ -40,6 +44,14 @@ env:
   UPSTREAM_REPO: ""              # e.g. "Forceu/Gokapi"
   IMAGE_NAME: ""                 # e.g. "ghcr.io/your-org/gokapi"
   TRIVY_SEVERITY: "CRITICAL,HIGH"
+  # Space-separated list of upstream paths whose changes should block the
+  # build until a human re-confirms dockerfiles/Dockerfile.override is
+  # still aligned with upstream. Only enforced when the override file
+  # exists; ignored otherwise. The default fits projects that keep one
+  # Dockerfile at the repo root. Multi-Dockerfile forks override this —
+  # e.g. uptime-kuma uses "docker/dockerfile docker/debian-base.dockerfile
+  # docker/builder-go.dockerfile".
+  UPSTREAM_DOCKERFILE_PATHS: "Dockerfile"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -193,6 +205,83 @@ jobs:
 
             git diff "$LAST".."$NEW" > ../audit/diff-full.patch 2>/dev/null || true
           fi
+
+      # --- GATE: Upstream Dockerfile drift -----------------------------------
+      # Our override is a full-file replacement, not a patch. When upstream
+      # changes their Dockerfile (new apt package, restructured stages, new
+      # COPY targets), our override may silently lag and produce a broken
+      # image. Trivy doesn't catch this class of drift. So we diff the
+      # configured Dockerfile path(s) between the last reviewed tag and the
+      # new tag and block the build until a human acknowledges (closes the
+      # filed issue). On the initial build there's nothing to diff against,
+      # so we pass through.
+      #
+      # Only enforced when an override is in use — projects that build the
+      # upstream Dockerfile unchanged inherit upstream's drift handling.
+      - name: Detect upstream Dockerfile drift
+        id: drift
+        if: steps.override.outputs.dockerfile_source == 'override'
+        env:
+          LAST:  ${{ needs.check-upstream.outputs.last_tag }}
+          NEW:   ${{ needs.check-upstream.outputs.new_tag }}
+          PATHS: ${{ env.UPSTREAM_DOCKERFILE_PATHS }}
+        run: |
+          set -e
+          if [ "$LAST" = "none" ] || [ -z "$LAST" ]; then
+            echo "No prior reviewed tag — initial build. Drift gate skipped."
+            echo "drift=initial" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cd upstream-src
+          # `git diff --name-only A..B -- <paths>` lists touched paths within the
+          # restriction. Pass PATHS unquoted so the shell splits on whitespace.
+          # shellcheck disable=SC2086
+          CHANGED=$(git diff --name-only "$LAST".."$NEW" -- $PATHS 2>/dev/null || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No drift in configured Dockerfile paths."
+            echo "drift=clean" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Drift detected in:"
+          printf '  %s\n' $CHANGED
+          # shellcheck disable=SC2086
+          git diff "$LAST".."$NEW" -- $PATHS > ../audit/dockerfile-drift.patch
+          echo "drift=changed" >> "$GITHUB_OUTPUT"
+
+      - name: File or update override-review issue
+        id: override-review
+        if: steps.drift.outputs.drift == 'changed'
+        uses: actions/github-script@v7
+        env:
+          NEW_TAG:  ${{ needs.check-upstream.outputs.new_tag }}
+          UPSTREAM: ${{ env.UPSTREAM_REPO }}
+          IMG:      ${{ env.IMAGE_NAME }}
+        with:
+          script: |
+            const fileCveIssue = require('./.github/scripts/file-cve-issue.js');
+            const result = await fileCveIssue({
+              github, context, core,
+              opts: {
+                kind: 'override-review',
+                tag: process.env.NEW_TAG,
+                upstream: process.env.UPSTREAM,
+                image: process.env.IMG,
+                driftPath: 'audit/dockerfile-drift.patch',
+              },
+            });
+            // Closed issue with this marker = a human already approved this
+            // upstream Dockerfile state. Anything else = pending review.
+            core.setOutput('blocked', result && result.blocked ? 'true' : 'false');
+
+      - name: Fail if override review pending
+        if: steps.drift.outputs.drift == 'changed' && steps.override-review.outputs.blocked == 'true'
+        env:
+          NEW_TAG: ${{ needs.check-upstream.outputs.new_tag }}
+        run: |
+          echo "::error::Upstream Dockerfile changed since last review. Override may need updating."
+          echo "::error::See the filed override-review issue for the diff. Close the issue (after reviewing"
+          echo "::error::the override) and re-run via workflow_dispatch to unblock the build."
+          exit 1
 
       # --- AUDIT 2a: Trivy fs scan of the cloned source ----------------------
       # An image scan only sees what survives the build. For Go/Rust binaries
