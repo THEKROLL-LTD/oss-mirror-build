@@ -346,6 +346,17 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Emit today's UTC date for use as APT_REFRESH build-arg. BuildKit hashes
+      # cache layers on (parent layer + RUN command string) — the apt repo
+      # state is not part of that hash, so an unchanged Dockerfile re-uses
+      # the cached apt layer indefinitely and never picks up new Debian
+      # security updates. Threading this date into the apt-install RUN
+      # invalidates the layer once per UTC day, which matches the Debian
+      # security cadence we promise. Within a day, cache reuse is unaffected.
+      - name: Compute APT_REFRESH date
+        id: apt-refresh
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Build image (load, no push)
         id: build
         uses: docker/build-push-action@v6
@@ -358,8 +369,12 @@ jobs:
           # binary's Main.Version. Overrides that don't declare ARG VERSION
           # ignore this silently — backward-compatible with plain upstream
           # Dockerfiles. See README "Module-path patching".
+          # APT_REFRESH busts the apt-install layer cache once per UTC day
+          # (see "Compute APT_REFRESH date" step). Overrides that don't
+          # declare ARG APT_REFRESH ignore it silently.
           build-args: |
             VERSION=${{ needs.check-upstream.outputs.new_tag }}
+            APT_REFRESH=${{ steps.apt-refresh.outputs.date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -445,6 +460,28 @@ jobs:
               },
             });
 
+      # Inverse gate: Trivy passed for this tag this run, so any open `block`
+      # issue from a previous (failing) run for the same tag is now stale.
+      # The helper looks it up by marker, posts a "resolved by run X" comment,
+      # and closes it. No-op if no such issue exists or it's already closed.
+      - name: Close CVE issue if scan clean
+        if: steps.trivy-scan.outcome == 'success' && steps.trivy-fs.outcome == 'success'
+        uses: actions/github-script@v7
+        env:
+          NEW_TAG: ${{ needs.check-upstream.outputs.new_tag }}
+          IMG:     ${{ env.IMAGE_NAME }}
+        with:
+          script: |
+            const fileCveIssue = require('./.github/scripts/file-cve-issue.js');
+            await fileCveIssue({
+              github, context, core,
+              opts: {
+                kind: 'block-resolved',
+                tag: process.env.NEW_TAG,
+                image: process.env.IMG,
+              },
+            });
+
       - name: Upload audit bundle
         uses: actions/upload-artifact@v4
         if: always()
@@ -478,6 +515,7 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
           build-args: |
             VERSION=${{ needs.check-upstream.outputs.new_tag }}
+            APT_REFRESH=${{ steps.apt-refresh.outputs.date }}
           cache-from: type=gha
 
       # --- Open a PR with the digest pin -------------------------------------
@@ -689,6 +727,27 @@ jobs:
                 image: process.env.IMG,
                 severity: process.env.SEV,
                 jsonPath: 'trivy-rescan.json',
+              },
+            });
+
+      # Inverse gate: rescan passed clean for last_tag, so any open `rescan`
+      # issue from a previous nightly is stale. Same close-on-resolve helper
+      # call as in the build job, with the rescan marker shape.
+      - name: Close rescan issue if rescan clean
+        if: steps.last.outputs.should_scan == 'true' && steps.trivy-rescan.outcome == 'success'
+        uses: actions/github-script@v7
+        env:
+          LAST_TAG: ${{ steps.last.outputs.last_tag }}
+          IMG:      ${{ env.IMAGE_NAME }}
+        with:
+          script: |
+            const fileCveIssue = require('./.github/scripts/file-cve-issue.js');
+            await fileCveIssue({
+              github, context, core,
+              opts: {
+                kind: 'rescan-resolved',
+                tag: process.env.LAST_TAG,
+                image: process.env.IMG,
               },
             });
 

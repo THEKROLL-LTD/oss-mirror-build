@@ -25,6 +25,26 @@ Why two scans: an image scan only sees what survives the build. For Go and Rust 
 
 On merge of the PR, your GitOps system (Flux, ArgoCD, or anything that pins `image-pin.yml`) rolls out the new digest.
 
+## Issues and PRs the workflow opens
+
+Everything the maintainer ever has to act on shows up in one of four places: a pull request or one of three issue types. The bot owns the lifecycle — it opens, updates, and closes them automatically. You only act when an issue is in front of you.
+
+| Surface | When it appears | Label(s) | What you do | Auto-close |
+|---|---|---|---|---|
+| **Pull request** on `mirror-build/<tag>` | Successful build: scan clean, image pushed to GHCR | `mirror-build` | Review the diff (upstream changes between last and new tag), merge to roll out the digest. | n/a — closed by your merge |
+| **Issue: `CVE found: …`** | Build-time scan found `CRITICAL`/`HIGH` with available fix; image was **not pushed** | `security`, `cve`, `blocked` | Decide: wait for upstream, add a documented `.trivyignore` waiver, or roll a Dockerfile-override patch. The build stays blocked until the next clean scan. | Closes itself when a later run scans clean for the same tag (`block-resolved`) |
+| **Issue: `New CVE detected in deployed image …`** | Nightly rescan of the previously-published image found a new finding (CVE database advanced after the build) | `security`, `cve`, `rescan` | Information only — the image is unchanged. Decide whether to wait for upstream or trigger an override+rebuild via `workflow_dispatch`. | Closes itself when the next rescan is clean (`rescan-resolved`) |
+| **Issue: `Override review required: …`** | Upstream changed one of the Dockerfile paths in `UPSTREAM_DOCKERFILE_PATHS` since you last reviewed; build is **blocked** | `override-review`, `blocked` | Read the diff in the issue, decide whether `dockerfiles/Dockerfile.override` needs updating. **Closing this issue IS your approval** — the build is unblocked on the next `workflow_dispatch`. | n/a — you close it manually; closing is the unblock |
+
+A few non-obvious lifecycle properties:
+
+- **All issues are idempotent per tag.** Re-running the same workflow against the same tag never spams duplicates. The bot finds the existing issue by hidden marker, updates body if findings shifted, posts a diff comment, and otherwise stays silent.
+- **Closing a CVE issue does NOT clear the underlying CVE.** It's treated as triage ("I've seen this finding-set"). If you close one and tomorrow's scan surfaces *different* CVEs against the same tag, the issue is **automatically reopened** with a comment listing what was added/cleared. If the next scan is bit-for-bit identical, the close is honored — no nagging.
+- **The `override-review` issue is the only one where closing is meaningful by itself.** Closing it tells the bot "the override still matches the new upstream, proceed." There is no automated reopen for override-reviews — re-flagging requires another upstream Dockerfile change.
+- **First run on a fresh fork** files no diff (no prior tag exists), and the rescan job skips silently (no `.last-built-tag` yet). From the second successful build onward, both kick in.
+
+If you only do one thing: **subscribe to `cve` and `override-review` labels in your fork's notification settings.** Those two cover every case where the build is blocked and waiting on you.
+
 ## Quickstart
 
 Five steps. Assumes you've worked with a statically-compiled upstream like Go or Rust before; more complex runtimes (Python with native deps, C with runtime-loaded libs) take longer for the first override.
@@ -106,41 +126,69 @@ Rule of thumb: if `head -1 go.mod` says `module foo/bar` and the upstream
 ships v2.x.x+ tags, you need this patch. If `go.mod` already ends in
 `/vN` matching the tag major, a plain override works without patching.
 
-## What each run produces
+### Daily distro-package refresh (`APT_REFRESH`)
 
-**Success path:**
+The workflow forwards a `APT_REFRESH=<UTC-date>` build-arg into every
+build. The intent is to invalidate the apt/apk install layer once per
+day so Debian (or Alpine) security advisories actually land in the
+nightly image.
 
-- Image pushed to `ghcr.io/<your-org>/<image>:<tag>` and `ghcr.io/<your-org>/<image>@sha256:<digest>`
-- Pull request opened on branch `mirror-build/<tag>` against `main`
-- PR body contains: digest, Dockerfile source (`override` or `upstream`), scan summary, links to artifacts
-- CycloneDX SBOMs (image + fs), Trivy SARIFs (image + fs), diff-review markdown, full diff patch — all retained 90 days as workflow artifacts
-- Trivy findings uploaded to the repository's Security tab under categories `trivy-image`, `trivy-fs`, and `trivy-rescan`
+Why this is needed: BuildKit hashes a `RUN` layer on `(parent layer +
+command string)`. The state of the upstream package mirror is **not**
+part of that hash. With `cache-from: type=gha` and an unchanged
+Dockerfile, BuildKit cache-hits on the apt layer indefinitely — even
+when Debian has shipped a new chromium/openssl/etc. The image gets
+re-tagged but the userland is frozen at the cache moment, and Trivy
+keeps flagging CVEs that have a fix available upstream.
 
-**Blocked path (CVE found):**
+Threading `APT_REFRESH` (today's UTC date) into the package-install
+command bumps the layer hash exactly once per UTC day. Within the same
+day, cache reuse is unaffected; across day boundaries, the apt/apk
+layer is re-resolved against the live mirror state. This matches
+Debian's security cadence, which publishes most updates day-of.
 
-- No image pushed
-- Issue opened with labels `security`, `cve`, `blocked`, linking the workflow run and Security tab
-- Same artifacts retained for review
-- Pipeline fails, blocking the next nightly until resolved (either a fixed upstream version appears or you add a documented waiver to `.trivyignore`)
+To use it in an override, declare the arg and reference it in the same
+`RUN` that calls `apt-get update`/`apk upgrade`:
 
-## Detecting CVEs published after release
+```dockerfile
+ARG APT_REFRESH=unset
 
-The main build job only scans images at build time — if a new CVE is
-published tomorrow against a dependency in yesterday's image, the main
-job won't notice until the next upstream release bumps the affected
-dependency.
+RUN echo "apt-refresh=${APT_REFRESH}" > /etc/.apt-refresh && \
+    apt-get update && \
+    apt-get install --no-install-recommends -y …
+```
 
-A second scheduled job, `rescan-last-build`, closes this gap. It runs
-on the same nightly schedule, pulls the last image recorded in
-`.last-built-tag`, rescans it with Trivy against the current database,
-and auto-files an issue (label `rescan`) if new findings appear. The
-image itself is never modified — this is information, not remediation.
-The decision *"wait for upstream"* vs. *"patch via Dockerfile override
-and rebuild"* stays human.
+A few gotchas:
 
-If your GHCR package is private, make sure the package settings link
-the mirror repository explicitly, otherwise the rescan job will fail
-with a 403 on image pull.
+- The default of `unset` keeps local `docker build` invocations working
+  without the arg (no daily cache-bust then, but no breakage either).
+- Threading it into the **first** apt/apk-using `RUN` is enough — every
+  later layer is downstream of that hash, so the cascade rebuilds them
+  too.
+- The name is `APT_REFRESH` for historical reasons (apt was the
+  original target). Alpine-based overrides reuse the same arg with
+  `apk` — the mechanism is identical.
+- Overrides that don't declare `ARG APT_REFRESH` ignore the build-arg
+  silently. Pure-distroless images (Gokapi-style) don't need it.
+
+## Artifacts every run produces
+
+Whether or not the build path ends with a push, the same evidence bundle is retained for 90 days as workflow artifacts so audits can reconstruct what was built and what was scanned:
+
+- CycloneDX SBOMs (image + filesystem)
+- Trivy SARIF reports (image + fs) — also uploaded to the repository's Security tab under categories `trivy-image`, `trivy-fs`, and `trivy-rescan`
+- Trivy JSON reports (used by the bot to file issues; same data, different format)
+- `diff-review.md` and `diff-full.patch` — git diff between the last built tag and the new one
+
+On a successful build the image is also pushed to `ghcr.io/<your-org>/<image>:<tag>` and `ghcr.io/<your-org>/<image>@sha256:<digest>`. The PR body contains: digest, Dockerfile source (`override` or `upstream`), scan summary, links to artifacts.
+
+## How the rescan job works
+
+The build-time scan only sees what existed when the image was built. If a new CVE is published tomorrow against a dependency in yesterday's image, the main job won't notice until the next upstream release bumps the affected dependency. The `rescan-last-build` job closes that gap — it runs on the nightly schedule (parallel to the main build), pulls the image recorded in `.last-built-tag`, rescans it against the current Trivy database, and files a `rescan`-labeled issue if anything new shows up.
+
+The image itself is never modified by this job — this is information, not remediation. The decision *"wait for upstream"* vs. *"patch via Dockerfile override and rebuild"* stays human. The `rescan` issue auto-closes the moment a later rescan comes back clean (typically when upstream ships the fix).
+
+If your GHCR package is private, link the mirror repository explicitly in the package settings, otherwise the rescan job will fail with a 403 on image pull.
 
 ## Configuration reference
 
