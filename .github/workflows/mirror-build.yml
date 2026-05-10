@@ -518,6 +518,29 @@ jobs:
             APT_REFRESH=${{ steps.apt-refresh.outputs.date }}
           cache-from: type=gha
 
+      # Inverse gate parallel to `Close CVE issue if scan clean` above: a
+      # successful push by definition means the just-pushed image passed
+      # Trivy at build time, which strictly supersedes any open rescan
+      # issue against the previously-deployed image at the same tag. Close
+      # it here so the issue tracker reflects ground truth without waiting
+      # for the next scheduled rescan (~24h cadence).
+      - name: Close rescan issue (push superseded the deployed image)
+        uses: actions/github-script@v7
+        env:
+          NEW_TAG: ${{ needs.check-upstream.outputs.new_tag }}
+          IMG:     ${{ env.IMAGE_NAME }}
+        with:
+          script: |
+            const fileCveIssue = require('./.github/scripts/file-cve-issue.js');
+            await fileCveIssue({
+              github, context, core,
+              opts: {
+                kind: 'rescan-resolved',
+                tag: process.env.NEW_TAG,
+                image: process.env.IMG,
+              },
+            });
+
       # --- Open a PR with the digest pin -------------------------------------
       # Human approval gate. The PR body is the summary; the workflow-run
       # artifacts are the evidence. On merge, image-pin.yml hits main and
