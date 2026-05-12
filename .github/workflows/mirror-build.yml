@@ -636,6 +636,7 @@ jobs:
       packages: read
       security-events: write     # Upload SARIF to Security tab
       issues: write              # File issue on new findings
+      pull-requests: write       # Auto-close stale mirror-build PR when rescan surfaces findings
       actions: read              # Required by codeql-action/upload-sarif telemetry
 
     steps:
